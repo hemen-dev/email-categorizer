@@ -6,7 +6,32 @@ Inspired by manually sorting 600+ emails at Toronto Animal Services.
 
 import os
 import re
+import logging
 from collections import defaultdict
+from datetime import datetime
+
+# ======================
+# LOGGING SETUP
+# ======================
+def setup_logging():
+    """Configure logging for the application."""
+    # Create logs directory if it doesn't exist
+    logs_dir = "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(logs_dir, 'email_categorizer.log')),
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+    return logging.getLogger(__name__)
+
+# Initialize logger
+logger = setup_logging()
 
 # ======================
 # CATEGORY DEFINITIONS
@@ -51,67 +76,205 @@ def categorize_email(content):
         return "GENERAL_INQUIRY"
 
 # ======================
-# FILE PROCESSING
+# FILE PROCESSING WITH ERROR HANDLING
 # ======================
 def process_single_email(filepath):
-    """Reads and categorizes a single email file."""
+    """Reads and categorizes a single email file with error handling."""
+    filename = os.path.basename(filepath)
+    
     try:
+        # 1. Check if file exists
+        if not os.path.exists(filepath):
+            logger.warning(f"File not found: {filename}")
+            return None
+        
+        # 2. Check file size (skip empty files)
+        file_size = os.path.getsize(filepath)
+        if file_size == 0:
+            logger.warning(f"Empty file: {filename}")
+            return None
+        
+        # 3. Warn about large files (optional)
+        if file_size > 1024 * 1024:  # 1MB
+            logger.info(f"Large file: {filename} ({file_size/1024:.1f} KB)")
+        
+        # 4. Read file with error handling
         with open(filepath, 'r', encoding='utf-8') as file:
             content = file.read()
         
-        category = categorize_email(content)
-        filename = os.path.basename(filepath)
+        # 5. Check if file has actual content
+        if not content.strip():
+            logger.warning(f"No content in: {filename}")
+            return None
         
-        # Get first line for preview
-        lines = content.strip().split('\n')
-        preview = lines[0] if lines else "No content"
+        # 6. Categorize the content
+        category = categorize_email(content)
+        logger.info(f"Processed: {filename} → {category}")
+        
+        # 7. Extract subject from email (better preview)
+        subject = "No subject"
+        for line in content.strip().split('\n'):
+            if line.lower().startswith('subject:'):
+                subject = line[8:].strip()  # Remove 'Subject: '
+                break
+        
+        # If no subject found, use first non-empty line
+        if subject == "No subject":
+            lines = [line.strip() for line in content.strip().split('\n') if line.strip()]
+            if lines:
+                subject = lines[0][:50]  # First 50 chars of first line
         
         return {
             'filename': filename,
-            'preview': preview[:60] + "..." if len(preview) > 60 else preview,
-            'category': category
+            'subject': subject[:60] + "..." if len(subject) > 60 else subject,
+            'category': category,
+            'filepath': filepath,
+            'size_bytes': file_size
         }
+        
+    except UnicodeDecodeError:
+        # Handle files that aren't UTF-8 encoded
+        logger.error(f"Encoding error: {filename} (not UTF-8)")
+        return None
+    except PermissionError:
+        logger.error(f"Permission denied: {filename}")
+        return None
+    except IsADirectoryError:
+        logger.error(f"Is a directory: {filename}")
+        return None
     except Exception as e:
-        print(f"Error reading {filepath}: {e}")
+        # Catch any other unexpected errors
+        logger.error(f"Unexpected error with {filename}: {type(e).__name__} - {str(e)[:50]}")
         return None
 
 # ======================
-# STATISTICS
+# ENHANCED STATISTICS
 # ======================
 def generate_statistics(email_data):
     """
-    Generates summary statistics.
+    Generates comprehensive statistics.
     
     Returns:
-        dict: Category counts
+        dict: Detailed statistics including percentages and insights
     """
+    if not email_data:
+        logger.warning("No email data provided for statistics")
+        return {}
+    
     stats = defaultdict(int)
+    category_previews = defaultdict(list)
+    total_size = 0
+    categories_found = set()
+    
+    # Collect data
     for email in email_data:
-        if email:  # Skip None values
-            stats[email['category']] += 1
-    return dict(stats)
+        if email:
+            category = email['category']
+            stats[category] += 1
+            categories_found.add(category)
+            total_size += email.get('size_bytes', 0)
+            
+            # Store preview (subject) for each category
+            preview = email.get('subject', 'No subject')
+            if len(category_previews[category]) < 3:  # Keep only 3 previews per category
+                category_previews[category].append(preview)
+    
+    total_emails = sum(stats.values())
+    
+    # Calculate percentages
+    percentages = {}
+    for category, count in stats.items():
+        percentages[category] = (count / total_emails) * 100 if total_emails > 0 else 0
+    
+    # Find most common category
+    most_common = max(stats.items(), key=lambda x: x[1]) if stats else ("N/A", 0)
+    
+    return {
+        'counts': dict(stats),
+        'percentages': percentages,
+        'total_emails': total_emails,
+        'total_size_bytes': total_size,
+        'total_size_mb': total_size / (1024 * 1024) if total_size > 0 else 0,
+        'categories_found': sorted(list(categories_found)),
+        'most_common': {
+            'category': most_common[0],
+            'count': most_common[1],
+            'percentage': percentages.get(most_common[0], 0)
+        },
+        'previews': dict(category_previews),
+        'processed_at': datetime.now().isoformat(),
+        'processing_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
 
 def print_statistics(stats):
-    """Prints statistics in a clean format."""
-    print("\n" + "="*50)
-    print("📊 EMAIL CATEGORIZATION STATISTICS")
-    print("="*50)
+    """Prints detailed statistics in a clean format."""
+    if not stats or stats.get('total_emails', 0) == 0:
+        print("\n📭 No email data to display")
+        logger.warning("No statistics to display")
+        return
     
-    total = 0
-    for category, count in sorted(stats.items()):
-        print(f"  {category:20} : {count:3}")
-        total += count
+    counts = stats.get('counts', {})
+    percentages = stats.get('percentages', {})
+    total_emails = stats.get('total_emails', 0)
+    most_common = stats.get('most_common', {})
     
-    print("-"*50)
-    print(f"  {'TOTAL':20} : {total:3}")
-    print("="*50)
+    print("\n" + "="*70)
+    print("📊 DETAILED EMAIL CATEGORIZATION REPORT")
+    print("="*70)
+    print(f"📅 Generated: {stats.get('processing_time', 'N/A')}")
+    print(f"📧 Total emails processed: {total_emails:,}")
+    
+    if stats.get('total_size_mb', 0) > 0:
+        print(f"💾 Total data size: {stats.get('total_size_mb', 0):.2f} MB")
+    
+    if most_common.get('category') != 'N/A':
+        print(f"🏆 Most common category: {most_common.get('category', 'N/A')} "
+              f"({most_common.get('count', 0)} emails, {most_common.get('percentage', 0):.1f}%)")
+    
+    print("-"*70)
+    
+    # Header
+    print(f"{'CATEGORY':20} {'COUNT':>8} {'PERCENTAGE':>12} {'SAMPLE':>30}")
+    print("-"*70)
+    
+    # Sort categories by count (descending)
+    sorted_categories = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    
+    for category, count in sorted_categories:
+        percent = percentages.get(category, 0)
+        
+        # Get a sample subject for this category
+        previews = stats.get('previews', {}).get(category, [])
+        sample = previews[0] if previews else "No samples"
+        
+        # Truncate sample if too long
+        if len(sample) > 28:
+            sample = sample[:25] + "..."
+        
+        # Print row with emoji based on category
+        emoji = {
+            'DOG_FOSTER': '🐶',
+            'CAT_FOSTER': '🐱',
+            'SMALL_ANIMAL': '🐰',
+            'VOLUNTEER': '👤',
+            'EVENTS': '🎪',
+            'GENERAL_INQUIRY': '📧'
+        }.get(category, '📄')
+        
+        print(f"{emoji} {category:18} {count:8,} {percent:11.1f}%  {sample:30}")
+    
+    print("="*70)
+    
+    # Log the statistics
+    logger.info(f"Statistics generated: {total_emails} emails processed across {len(counts)} categories")
+    logger.info(f"Most common category: {most_common.get('category')} ({most_common.get('percentage', 0):.1f}%)")
 
 # ======================
 # TESTING
 # ======================
 def run_tests():
     """Tests the categorizer with sample text."""
-    print("🧪 Testing categorizer logic...")
+    logger.info("Running categorization tests...")
     
     tests = [
         ("I want to foster a dog", "DOG_FOSTER"),
@@ -126,11 +289,14 @@ def run_tests():
     for text, expected in tests:
         result = categorize_email(text)
         if result == expected:
-            print(f"  ✅ '{text[:25]}...' → {result}")
+            logger.debug(f"Test passed: '{text[:25]}...' → {result}")
             passed += 1
+            print(f"  ✅ '{text[:25]}...' → {result}")
         else:
+            logger.error(f"Test failed: '{text[:25]}...' → {result} (expected {expected})")
             print(f"  ❌ '{text[:25]}...' → {result} (expected {expected})")
     
+    logger.info(f"Tests passed: {passed}/{len(tests)}")
     print(f"\n  Tests passed: {passed}/{len(tests)}")
     return passed == len(tests)
 
@@ -170,11 +336,17 @@ def main():
     
     # 3. Process each file
     email_data = []
+    successful = 0
     for filepath in email_files:
         result = process_single_email(filepath)
         if result:
             email_data.append(result)
+            successful += 1
             print(f"   📄 {result['filename']:20} → {result['category']}")
+    
+    # Show processing summary
+    if successful < len(email_files):
+        print(f"   ⚠️  Successfully processed: {successful}/{len(email_files)} emails")
     
     # 4. Show statistics
     print(f"\n[3/3] Generating report...")
